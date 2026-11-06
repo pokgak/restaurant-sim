@@ -1,0 +1,10 @@
+export const MAX_BODY_BYTES = 64 * 1024;
+export const MAX_CREATE_BODY_BYTES = 32 * 1024;
+export const MAX_ARTIFACT_BYTES = 16 * 1024 * 1024;
+export const MAX_GAME_TICKS = 10_000;
+export const MAX_STEP_TICKS = 100;
+export const MAX_START_TICKS = 1_000;
+export const MIN_INTERVAL_MS = 100;
+export const MAX_INTERVAL_MS = 60_000;
+export const MAX_REQUEST_ID_LENGTH = 128;
+export const MAX_TOKEN_LENGTH = 512;

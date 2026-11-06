@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "restaurant-sim-client"
+version = "0.1.0"
+description = "Zero-dependency Python client and heuristic baseline for Restaurant Sim"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+rsim = "restaurant_sim.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["restaurant_sim*"]

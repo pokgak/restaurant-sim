@@ -1,0 +1,12 @@
+node_modules/
+.pnpm-store/
+dist/
+coverage/
+.wrangler/
+.tmp/
+.dev.vars
+*.log
+__pycache__/
+*.py[cod]
+.venv/
+.DS_Store
