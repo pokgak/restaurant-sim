@@ -1,8 +1,7 @@
 # Pure Clef policy-controller holdout
 
-Status: **deployed and preregistered; fresh holdout not run**. The development-only
-policy sweep is complete. No paid calls or confirmatory runs have been made on the
-fresh seeds in this document.
+Status: **holdout complete**. The development-only policy sweep and all three frozen
+fresh-seed arms have run. No failed fresh-seed episode was replaced or rerun.
 
 ## Frozen hypothesis and protocol
 
@@ -116,9 +115,80 @@ Report per-seed solvency and cumulative operating profit first, then matched arm
 selected-policy counts, action and acceptance counts, evaluator probabilities, costs,
 failures, and archive verification. An unverified archive is not a successful run.
 
-## Prepared commands (do not run during implementation)
+## Holdout results
 
-The examples share one conservative budget ledger. Carry the final tracked and
+The fixed policy won. Every completed restaurant remained solvent, but Clef's policy
+switching reduced cumulative operating profit. The Clef-5 arm also lost one episode to
+a Cloudflare-side HTTP 503 while reading game state after nine decisions. Its partial
+`68,877`-cent profit is retained in the verified failure archive but excluded from
+completed-run aggregates.
+
+| Seed | Fixed `maintenance_first` | Clef-5 | Clef-5 delta | Clef-10 | Clef-10 delta |
+|---:|---:|---:|---:|---:|---:|
+| 4101011 | 143,652 | 192,704 | +49,052 | 108,934 | -34,718 |
+| 4101012 | 212,545 | 87,745 | -124,800 | 76,055 | -136,490 |
+| 4101013 | 263,578 | failed (HTTP 503) | not comparable | 259,627 | -3,951 |
+| 4101014 | 270,430 | 165,092 | -105,338 | 166,484 | -103,946 |
+| 4101015 | 153,588 | 129,694 | -23,894 | 24,282 | -129,306 |
+
+All numeric results in the table are solvent, completed, and R2-verified.
+
+| Arm | Completed | Solvent | Completed profit total | Mean profit | Clef calls | Incremental cost |
+|---|---:|---:|---:|---:|---:|---:|
+| Fixed `maintenance_first` | 5/5 | 5/5 | 1,043,793 | 208,758.60 | 0 | $0 |
+| Clef-5 | 4/5 | 4/4 completed | 575,235 | 143,808.75 | 121 | $0.35046048 |
+| Clef-10 | 5/5 | 5/5 | 635,382 | 127,076.40 | 140 | $0.55027152 |
+
+On the four completed matched Clef-5 seeds, Clef-5 lost `204,980` cents in total,
+or `51,245` cents per seed, and beat fixed on one of four. Clef-10 lost `408,411`
+cents in total, or `81,682.20` cents per seed, and beat fixed on zero of five. Clef-10
+also lost `199,480` cents to Clef-5 on their four jointly completed seeds.
+
+All 15 episode archives verified, including the Clef-5 infrastructure failure. Across
+the three arms, deterministic policies submitted 933 actions and the simulator accepted
+all 933 without rejection. No policy episode made a generative-model call.
+
+### What Clef selected
+
+| Arm | Decisions | `balanced` | `cash_guard` | `maintenance_first` | `moderate_growth` | `debt_averse` | Policy switches |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Clef-5 | 121 | 100 | 8 | 10 | 3 | 0 | 33 |
+| Clef-10 | 140 | 94 | 19 | 7 | 0 | 20 | 60 |
+
+The other six 10-policy candidates were never selected. Clef-5 switched at 33 of 116
+eligible decision boundaries (28.4%); Clef-10 switched at 60 of 135 (44.4%). Mean
+top-versus-runner-up solvency margins were only `0.01425` and `0.01109`, respectively.
+One Clef-10 choice required the frozen profit-score tie-break; every other choice was
+decided by solvency probability alone.
+
+Clef systematically preferred `balanced` over the development winner. Mean predicted
+solvency was `0.9365` for `balanced` versus `0.9152` for `maintenance_first` in Clef-5,
+and `0.9398` versus `0.9171` in Clef-10. Because the objective is lexicographic, these
+small solvency differences overrode profit estimates even though all ten policies had
+been solvent on all replacement-adjusted development runs.
+
+The operational traces are consistent with under-maintenance, without proving that it
+alone caused the profit gap. Fixed scheduled 8.8 maintenance actions and suffered 1.6
+breakdowns per completed run. Clef-5 scheduled 5.25 and suffered 2.75; Clef-10 scheduled
+4.8 and suffered 2.8. Clef-10 also finished with 7.6 total staff on average versus 11.4
+for fixed, which reduced mean units sold from 596.8 to 511.6.
+
+There is also a contract-execution mismatch to address before another confirmatory run:
+Clef predicts each candidate as a complete continuation through tick 84, but the runner
+executes only that candidate's current actions and asks Clef to choose again three ticks
+later. Frequent switching therefore creates a hybrid trajectory that no scored
+continuation describes. A follow-up should either commit to the selected policy for the
+episode or score a frozen finite commitment window that matches what is executed.
+
+The two Clef arms used 3,753,050 input tokens and cost `$0.900732` in total. Including
+the earlier experiment ledger, tracked spend ended at `$13.547696` of the `$100` ceiling,
+with no uncertain reserve. The production run used Worker version
+`9668c547-7e20-4777-8014-b31f530764ec` at 100% traffic. These are five-seed results;
+they support a directional comparison, not a significance claim.
+
+## Reproduction commands
+
+The executed arms shared one conservative budget ledger. Carry the final tracked and
 uncertain values from each command into the next command.
 
 Fixed policy (zero model/evaluator calls):
