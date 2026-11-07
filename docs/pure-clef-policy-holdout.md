@@ -1,7 +1,8 @@
 # Pure Clef policy-controller holdout
 
-Status: **implementation prepared, not run**. No paid calls or confirmatory runs have
-been made on the seeds in this document.
+Status: **deployed and preregistered; fresh holdout not run**. The development-only
+policy sweep is complete. No paid calls or confirmatory runs have been made on the
+fresh seeds in this document.
 
 ## Frozen hypothesis and protocol
 
@@ -30,11 +31,31 @@ descriptions and serialized `BaselineConfig` parameters are versioned as
 `restaurant-sim-policy-v1`. The frozen library SHA-256 is
 `8e357a03fb3e5a54defb5a10f411bec4e13944aa038b4235f88c1c4c614178ca`.
 
-The fixed arm uses **`balanced`**. It was selected before this holdout from development
-work restricted to the earlier development seeds `4101001..4101005` and the established
-default heuristic configuration. It must not be changed after any result from the fresh
-seeds is observed. The fresh seeds must not be used for policy selection, parameter
-tuning, prompt tuning, or arm removal.
+The fixed arm uses **`maintenance_first`**. It was selected before this holdout by
+running every frozen policy on the earlier development seeds `4101001..4101010`, then
+ranking policies by solvent episodes first and total cumulative operating profit
+second. All 100 replacement-adjusted episodes remained solvent; `maintenance_first`
+led with `1,586,217` cents total profit, ahead of `balanced` at `1,480,628` cents.
+
+| Development rank | Policy | Solvent | Total profit (cents) |
+|---:|---|---:|---:|
+| 1 | `maintenance_first` | 10/10 | 1,586,217 |
+| 2 | `balanced` | 10/10 | 1,480,628 |
+| 3 | `moderate_growth` | 10/10 | 1,387,222 |
+| 4 | `debt_averse` | 10/10 | 1,309,712 |
+| 5 | `cash_guard` | 10/10 | 859,081 |
+| 6 | `price_power` | 10/10 | 855,536 |
+| 7 | `workforce_quality` | 10/10 | 732,716 |
+| 8 | `growth_credit` | 10/10 | 697,802 |
+| 9 | `lean_operator` | 10/10 | 663,241 |
+| 10 | `inventory_buffer` | 10/10 | 642,176 |
+
+The first `lean_operator` seed-4101010 attempt hit a Cloudflare-side HTTP 503 while the
+new Worker version was being deployed. Its verified failed archive was retained and
+excluded; one labeled development-only replacement completed at `80,530` cents and is
+included above. No other development episode was replaced. The selected policy must
+not change after any result from the fresh seeds is observed. The fresh seeds must not
+be used for policy selection, parameter tuning, prompt tuning, or arm removal.
 
 ## Clef evaluator contract
 
@@ -84,7 +105,7 @@ Use exactly `4101011,4101012,4101013,4101014,4101015` for every arm:
 
 | Arm | Frozen mode | Generative calls |
 |---|---|---|
-| development-selected fixed policy | `fixed`, `balanced` | none |
+| development-selected fixed policy | `fixed`, `maintenance_first` | none |
 | Clef 5 | `clef`, first 5 policies | only `/api/policy-evaluate` |
 | Clef 10 | `clef`, all 10 policies | only `/api/policy-evaluate` |
 
@@ -104,15 +125,15 @@ Fixed policy (zero model/evaluator calls):
 
 ```sh
 python clients/python/scripts/run_model_batch.py \
-  --batch-id "$EXPERIMENT_ID-fixed-balanced" \
+  --batch-id "$EXPERIMENT_ID-fixed-maintenance-first" \
   --models policy \
   --seeds 4101011,4101012,4101013,4101014,4101015 \
   --policy-controller fixed \
-  --fixed-policy-id balanced \
+  --fixed-policy-id maintenance_first \
   --base-url "$WORKER_URL" \
   --inference-url "$WORKER_URL/api/inference" \
   --token-file "$ADMIN_TOKEN_FILE" \
-  --output-dir "$OUTPUT_ROOT/$EXPERIMENT_ID-fixed-balanced" \
+  --output-dir "$OUTPUT_ROOT/$EXPERIMENT_ID-fixed-maintenance-first" \
   --workers 5 --canary-first \
   --initial-cost-usd "$INITIAL_COST_USD" \
   --initial-uncertain-cost-usd "$INITIAL_UNCERTAIN_COST_USD" \
