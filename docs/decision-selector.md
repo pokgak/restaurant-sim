@@ -1,5 +1,14 @@
 # System One plan selection
 
+> **Completed ablation, retained for reproduction.** This is not the current Clef
+> design. In the verified 5-plan and 10-plan GLM-5.3 cohorts, Clef chose `no_action`
+> in 0 of 152 decisions. The runner's separate `0.5` confidence threshold nevertheless
+> executed `no_action` in 141 decisions. Both cohorts went bankrupt in all five seeds,
+> with mean profit of `-139,929.4` cents (5-plan) and `-152,555.6` cents (10-plan).
+> The experiment therefore measured an abstention-heavy wrapper more than plan choice.
+> The replacement verifier experiment is specified in
+> [`clef-plan-verifier.md`](./clef-plan-verifier.md).
+
 The optional `clef` decision selector separates plan generation from plan choice.
 The primary reasoning model proposes alternatives; Cloudflare Clef makes one typed
 comparison; ordinary code decides whether the result is confident enough to execute.
@@ -53,9 +62,9 @@ python clients/python/scripts/run_model_batch.py \
   ...
 ```
 
-## Evaluation arms
+## Original evaluation arms
 
-The first comparison should use the same primary model, seeds, reasoning effort,
+The completed comparison used the same primary model, seeds, reasoning effort,
 temperature, token policy, cadence, and simulator version:
 
 - **single-plan reactive:** the existing model chooses one plan every decision tick;
@@ -68,7 +77,7 @@ Report terminal profit and bankruptcy first, then selection probability, fallbac
 rate, proposed versus submitted actions, debt, waste, planner cost, selector cost, and
 latency. Do not tune the threshold per model or seed.
 
-The first paid count comparison uses GLM-5.3, the same seeds `4101001..4101005`, and
+The paid count comparison used GLM-5.3, the same seeds `4101001..4101005`, and
 the same model settings for separate 5-plan and 10-plan cohorts. Both cohorts share
 one conservative `$100` ceiling. The 3-plan mode remains available as the original
 contract and is not silently mixed into either cohort.

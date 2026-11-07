@@ -123,7 +123,26 @@ planner for exactly 3, 5, or 10 distinct feasible plans without choosing among t
 The batch runner's `--decision-selector clef` mode adds a no-action candidate and
 sends the complete set to one typed Clef `choice` question. The selector targets the
 exact terminal leaderboard outcome and records its complete probability distribution;
-see [`docs/decision-selector.md`](../../docs/decision-selector.md).
+see [`docs/decision-selector.md`](../../docs/decision-selector.md). This mode is kept
+for reproduction of the completed selector ablation; it is not the current Clef
+integration.
+
+`DecisionHarness.review(...)` asks the original planner to return one complete revised
+decision after seeing its first decision, deterministic preflight, and a semantic
+verification result. The batch runner exposes three mutually exclusive verifier arms:
+
+- `--plan-verifier none`: execute the first valid plan;
+- `--plan-verifier always`: always pay for one GLM review (the active control);
+- `--plan-verifier clef`: ask one frozen Clef Noul question about a material state
+  misread, execute below `0.3`, request optional review from `0.3` to below `0.7`, and
+  require a changed reviewed action plan at or above `0.7`.
+
+Clef does not forecast the terminal score or calculate simulator mechanics. A Clef
+transport or response-contract error routes to GLM review rather than silently
+becoming `no_action`; budget exhaustion still stops the run. Original plans, verifier
+requests and probabilities, review plans, routes, changed actions, usage, and costs are
+archived independently. See the frozen design and prepared holdout in
+[`docs/clef-plan-verifier.md`](../../docs/clef-plan-verifier.md).
 
 Validate saved JSON without invoking a model:
 

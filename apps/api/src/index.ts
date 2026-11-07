@@ -27,7 +27,10 @@ import type {
 
 export { GameRoom } from "./game-room";
 
-type RuntimeEnv = Env & { BENCHMARK_ADMIN_TOKEN?: string };
+type RuntimeEnv = Env & {
+  BENCHMARK_ADMIN_TOKEN?: string;
+  BENCHMARK_ADMIN_TOKEN_SHA256?: string;
+};
 
 type GameRoomRpcStub = DurableObjectStub & {
   initialize(input: InitializeInput): Promise<RpcResult>;
@@ -76,8 +79,43 @@ interface InferenceRequest {
 
 const DECISION_MODEL = "@cf/cloudflare/clef" as const;
 const DECISION_CONTRACT_VERSION = "restaurant-sim-plan-selector-v1";
+const PLAN_VERIFY_CONTRACT_VERSION = "restaurant-sim-plan-verifier-v1";
+const POLICY_EVALUATE_CONTRACT_VERSION = "restaurant-sim-policy-evaluator-v1";
+const POLICY_VERSION = "restaurant-sim-policy-v1";
 const MAX_DECISION_SELECT_BODY_BYTES = 1024 * 1024;
+const MAX_POLICY_DESCRIPTION_LENGTH = 2_000;
 const SUPPORTED_DECISION_CANDIDATE_COUNTS = [3, 5, 10] as const;
+const POLICY_CANDIDATE_IDS = [
+  "balanced",
+  "cash_guard",
+  "maintenance_first",
+  "lean_operator",
+  "moderate_growth",
+  "inventory_buffer",
+  "price_power",
+  "workforce_quality",
+  "debt_averse",
+  "growth_credit",
+] as const;
+const POLICY_BENCHMARK_OBJECTIVE =
+  "Evaluate each candidate policy as a complete deterministic continuation from the current observation through tick 84. First estimate whether the restaurant remains solvent through tick 84. Separately estimate its final cumulative operating profit band at tick 84. Do not optimize revenue, cash, reputation, survival duration, or action count except insofar as they improve solvency and cumulative operating profit.";
+const POLICY_SOLVENCY_QUESTION =
+  "Will this candidate policy keep the restaurant solvent through tick 84?";
+const POLICY_SOLVENCY_TRUE_CRITERION =
+  "The restaurant is not bankrupt at tick 84.";
+const POLICY_SOLVENCY_FALSE_CRITERION =
+  "The restaurant becomes bankrupt at any tick through tick 84.";
+const POLICY_PROFIT_QUESTION =
+  "What cumulative operating profit band will this candidate policy finish in at tick 84?";
+const POLICY_PROFIT_CRITERIA = [
+  "Below -500000 cents",
+  "-500000 to -300001 cents",
+  "-300000 to -200001 cents",
+  "-200000 to -100001 cents",
+  "-100000 to -1 cents",
+  "0 to 99999 cents",
+  "At least 100000 cents",
+] as const;
 const DECISION_SELECTION_OUTCOME =
   "Choose the candidate most likely to achieve the best benchmark result at tick 84. " +
   "A restaurant that remains solvent through tick 84 ranks above every bankrupt " +
@@ -91,6 +129,30 @@ const DECISION_SELECTION_INSTRUCTIONS =
   "planner notes as unverified hypotheses. Account for immediate and recurring costs, " +
   "pending commitments, remaining ticks, and uncertainty without assuming hidden future " +
   "events.";
+const PLAN_VERIFY_INSTRUCTIONS =
+  "Does proposedPlan rely on a factual assumption contradicted by observation or " +
+  "deterministicReview, where that contradiction could materially change whether its " +
+  "actions should execute now?";
+const PLAN_VERIFY_TRUE_CRITERION =
+  "A stated or implied assumption about liquidity, recurring cost, inventory or " +
+  "delivery timing, equipment, staffing pipeline, capacity, or action ordering " +
+  "conflicts with supplied evidence.";
+const PLAN_VERIFY_FALSE_CRITERION =
+  "No material contradiction is supported. Uncertainty about hidden future events or " +
+  "the tick-84 result alone does not count.";
+const PLAN_ACTION_TYPES = new Set([
+  "borrow",
+  "expedite_delivery",
+  "invest",
+  "purchase_inventory",
+  "repair_equipment",
+  "repay_loan",
+  "schedule_maintenance",
+  "set_marketing",
+  "set_menu_price",
+  "set_staff",
+  "train_staff",
+]);
 
 function decisionCriterion(candidateId: string): string {
   return (
@@ -118,6 +180,64 @@ interface DecisionSelectRequest {
   questions: { terminal_outcome: DecisionQuestion };
 }
 
+interface PlanVerifyQuestion {
+  type: "noul";
+  instructions: typeof PLAN_VERIFY_INSTRUCTIONS;
+  criteria: {
+    true: typeof PLAN_VERIFY_TRUE_CRITERION;
+    false: typeof PLAN_VERIFY_FALSE_CRITERION;
+  };
+}
+
+interface PlanVerifyState {
+  contractVersion: typeof PLAN_VERIFY_CONTRACT_VERSION;
+  observation: Record<string, JsonValue>;
+  outcomeFeedback: Record<string, JsonValue> | null;
+  proposedPlan: { actions: JsonValue[]; note: string };
+  deterministicReview: {
+    submittable: true;
+    validatedActions: JsonValue[];
+    issues: JsonValue[];
+    previews: JsonValue[];
+    projected: Record<string, JsonValue>;
+  };
+}
+
+interface PlanVerifyRequest {
+  model: typeof DECISION_MODEL;
+  state: PlanVerifyState;
+  questions: { material_state_misread: PlanVerifyQuestion };
+}
+
+interface PolicySolvencyQuestion {
+  type: "noul";
+  instructions: {
+    policyId: string;
+    question: typeof POLICY_SOLVENCY_QUESTION;
+  };
+  criteria: {
+    true: typeof POLICY_SOLVENCY_TRUE_CRITERION;
+    false: typeof POLICY_SOLVENCY_FALSE_CRITERION;
+  };
+}
+
+interface PolicyProfitQuestion {
+  type: "score";
+  instructions: {
+    policyId: string;
+    question: typeof POLICY_PROFIT_QUESTION;
+  };
+  criteria: string[];
+}
+
+type PolicyEvaluationQuestion = PolicySolvencyQuestion | PolicyProfitQuestion;
+
+interface PolicyEvaluateRequest {
+  model: typeof DECISION_MODEL;
+  state: Record<string, JsonValue>;
+  questions: Record<string, PolicyEvaluationQuestion>;
+}
+
 type ClefBinding = {
   run(
     model: typeof DECISION_MODEL,
@@ -125,6 +245,22 @@ type ClefBinding = {
       model: "clef";
       state: Record<string, JsonValue>;
       questions: { terminal_outcome: DecisionQuestion };
+    },
+  ): Promise<unknown>;
+  run(
+    model: typeof DECISION_MODEL,
+    input: {
+      model: "clef";
+      state: PlanVerifyState;
+      questions: { material_state_misread: PlanVerifyQuestion };
+    },
+  ): Promise<unknown>;
+  run(
+    model: typeof DECISION_MODEL,
+    input: {
+      model: "clef";
+      state: Record<string, JsonValue>;
+      questions: Record<string, PolicyEvaluationQuestion>;
     },
   ): Promise<unknown>;
 };
@@ -408,6 +544,311 @@ function parseDecisionSelectRequest(value: unknown): DecisionSelectRequest {
   return value as unknown as DecisionSelectRequest;
 }
 
+function parsePlanVerifyRequest(value: unknown): PlanVerifyRequest {
+  if (!isRecord(value)) {
+    throw new HttpError(
+      400,
+      "invalid_plan_verify",
+      "Plan verification body must be an object",
+    );
+  }
+  const expected = new Set(["model", "state", "questions"]);
+  const unexpected = Object.keys(value).filter((key) => !expected.has(key));
+  if (unexpected.length > 0) {
+    throw new HttpError(
+      400,
+      "invalid_plan_verify",
+      `Unexpected plan verification field(s): ${unexpected.sort().join(", ")}`,
+    );
+  }
+  if (value.model !== DECISION_MODEL) {
+    throw new HttpError(
+      400,
+      "invalid_plan_verify",
+      "Unsupported plan verification model",
+    );
+  }
+  if (!isRecord(value.state)) {
+    throw new HttpError(400, "invalid_plan_verify", "state must be an object");
+  }
+  const stateFields = new Set([
+    "contractVersion",
+    "observation",
+    "outcomeFeedback",
+    "proposedPlan",
+    "deterministicReview",
+  ]);
+  if (
+    Object.keys(value.state).length !== stateFields.size ||
+    Object.keys(value.state).some((key) => !stateFields.has(key)) ||
+    value.state.contractVersion !== PLAN_VERIFY_CONTRACT_VERSION ||
+    !isRecord(value.state.observation) ||
+    (value.state.outcomeFeedback !== null && !isRecord(value.state.outcomeFeedback)) ||
+    !isRecord(value.state.proposedPlan) ||
+    !isRecord(value.state.deterministicReview)
+  ) {
+    throw new HttpError(
+      400,
+      "invalid_plan_verify",
+      "state does not match the plan-verifier contract",
+    );
+  }
+
+  const proposedPlan = value.state.proposedPlan;
+  const proposedActions = proposedPlan.actions;
+  if (
+    Object.keys(proposedPlan).length !== 2 ||
+    Object.keys(proposedPlan).some((key) => key !== "actions" && key !== "note") ||
+    !Array.isArray(proposedActions) ||
+    proposedActions.length > 5 ||
+    !proposedActions.every(isPlanAction) ||
+    typeof proposedPlan.note !== "string"
+  ) {
+    throw new HttpError(
+      400,
+      "invalid_plan_verify",
+      "proposedPlan must be exactly {actions,note} with at most 5 actions",
+    );
+  }
+
+  const deterministicReview = value.state.deterministicReview;
+  const reviewFields = new Set([
+    "submittable",
+    "validatedActions",
+    "issues",
+    "previews",
+    "projected",
+  ]);
+  if (
+    Object.keys(deterministicReview).length !== reviewFields.size ||
+    Object.keys(deterministicReview).some((key) => !reviewFields.has(key)) ||
+    deterministicReview.submittable !== true ||
+    !Array.isArray(deterministicReview.validatedActions) ||
+    !Array.isArray(deterministicReview.issues) ||
+    !deterministicReview.issues.every(isValidationIssue) ||
+    !Array.isArray(deterministicReview.previews) ||
+    deterministicReview.previews.length !== proposedActions.length ||
+    !deterministicReview.previews.every((preview, index) =>
+      isActionPreview(preview, index, proposedActions[index]),
+    ) ||
+    !isRecord(deterministicReview.projected)
+  ) {
+    throw new HttpError(
+      400,
+      "invalid_plan_verify",
+      "deterministicReview does not match DecisionReview.feedback()",
+    );
+  }
+  if (
+    !jsonStructurallyEqual(
+      proposedActions,
+      deterministicReview.validatedActions,
+    )
+  ) {
+    throw new HttpError(
+      400,
+      "invalid_plan_verify",
+      "deterministicReview.validatedActions must match proposedPlan.actions",
+    );
+  }
+
+  if (
+    !isRecord(value.questions) ||
+    Object.keys(value.questions).length !== 1 ||
+    !isRecord(value.questions.material_state_misread)
+  ) {
+    throw new HttpError(
+      400,
+      "invalid_plan_verify",
+      "questions must contain only material_state_misread",
+    );
+  }
+  const question = value.questions.material_state_misread;
+  if (
+    Object.keys(question).length !== 3 ||
+    Object.keys(question).some(
+      (key) => !["type", "instructions", "criteria"].includes(key),
+    ) ||
+    question.type !== "noul" ||
+    question.instructions !== PLAN_VERIFY_INSTRUCTIONS ||
+    !isRecord(question.criteria) ||
+    Object.keys(question.criteria).length !== 2 ||
+    question.criteria.true !== PLAN_VERIFY_TRUE_CRITERION ||
+    question.criteria.false !== PLAN_VERIFY_FALSE_CRITERION
+  ) {
+    throw new HttpError(
+      400,
+      "invalid_plan_verify",
+      "material_state_misread must match the fixed Noul question",
+    );
+  }
+  return value as unknown as PlanVerifyRequest;
+}
+
+function policyCandidateIds(candidateCount: number): string[] {
+  return POLICY_CANDIDATE_IDS.slice(0, candidateCount);
+}
+
+function policyQuestionIds(candidateIds: string[]): string[] {
+  return candidateIds.flatMap((policyId) => [
+    `${policyId}_solvent`,
+    `${policyId}_profit_band`,
+  ]);
+}
+
+function parsePolicyEvaluateRequest(value: unknown): PolicyEvaluateRequest {
+  if (!isRecord(value) || !hasExactFields(value, ["model", "state", "questions"])) {
+    throw new HttpError(
+      400,
+      "invalid_policy_evaluate",
+      "Policy evaluation body must contain exactly model, state, and questions",
+    );
+  }
+  if (value.model !== DECISION_MODEL) {
+    throw new HttpError(
+      400,
+      "invalid_policy_evaluate",
+      "Unsupported policy evaluation model",
+    );
+  }
+  if (
+    !isRecord(value.state) ||
+    !hasExactFields(value.state, [
+      "contractVersion",
+      "candidateCount",
+      "benchmarkObjective",
+      "terminalTick",
+      "observation",
+      "outcomeFeedback",
+      "candidates",
+    ]) ||
+    value.state.contractVersion !== POLICY_EVALUATE_CONTRACT_VERSION ||
+    (value.state.candidateCount !== 5 && value.state.candidateCount !== 10) ||
+    value.state.benchmarkObjective !== POLICY_BENCHMARK_OBJECTIVE ||
+    value.state.terminalTick !== 84 ||
+    !isRecord(value.state.observation) ||
+    (value.state.outcomeFeedback !== null && !isRecord(value.state.outcomeFeedback)) ||
+    !Array.isArray(value.state.candidates) ||
+    value.state.candidates.length !== value.state.candidateCount
+  ) {
+    throw new HttpError(
+      400,
+      "invalid_policy_evaluate",
+      "state does not match the policy-evaluator contract",
+    );
+  }
+
+  const candidateIds = policyCandidateIds(value.state.candidateCount);
+  for (const [index, candidate] of value.state.candidates.entries()) {
+    if (
+      !isRecord(candidate) ||
+      !hasExactFields(candidate, [
+        "policyId",
+        "policyVersion",
+        "description",
+        "parameters",
+        "actions",
+        "previews",
+        "projected",
+      ]) ||
+      candidate.policyId !== candidateIds[index] ||
+      candidate.policyVersion !== POLICY_VERSION ||
+      typeof candidate.description !== "string" ||
+      candidate.description.trim().length === 0 ||
+      candidate.description.length > MAX_POLICY_DESCRIPTION_LENGTH ||
+      !isRecord(candidate.parameters) ||
+      !Array.isArray(candidate.actions) ||
+      !Array.isArray(candidate.previews) ||
+      !isRecord(candidate.projected)
+    ) {
+      throw new HttpError(
+        400,
+        "invalid_policy_evaluate",
+        `state.candidates[${index}] is invalid`,
+      );
+    }
+    const actions = candidate.actions;
+    const previews = candidate.previews;
+    if (
+      actions.length > 5 ||
+      !actions.every(isPlanAction) ||
+      previews.length !== actions.length ||
+      !previews.every((preview, actionIndex) =>
+        isActionPreview(preview, actionIndex, actions[actionIndex]),
+      )
+    ) {
+      throw new HttpError(
+        400,
+        "invalid_policy_evaluate",
+        `state.candidates[${index}] is invalid`,
+      );
+    }
+  }
+
+  const questionIds = policyQuestionIds(candidateIds);
+  if (
+    !isRecord(value.questions) ||
+    Object.keys(value.questions).length !== questionIds.length ||
+    questionIds.some(
+      (questionId) =>
+        !Object.prototype.hasOwnProperty.call(value.questions, questionId),
+    )
+  ) {
+    throw new HttpError(
+      400,
+      "invalid_policy_evaluate",
+      "questions must contain exactly two questions per policy",
+    );
+  }
+
+  for (const policyId of candidateIds) {
+    const solvent = value.questions[`${policyId}_solvent`];
+    if (
+      !isRecord(solvent) ||
+      !hasExactFields(solvent, ["type", "instructions", "criteria"]) ||
+      solvent.type !== "noul" ||
+      !isRecord(solvent.instructions) ||
+      !hasExactFields(solvent.instructions, ["policyId", "question"]) ||
+      solvent.instructions.policyId !== policyId ||
+      solvent.instructions.question !== POLICY_SOLVENCY_QUESTION ||
+      !isRecord(solvent.criteria) ||
+      !hasExactFields(solvent.criteria, ["true", "false"]) ||
+      solvent.criteria.true !== POLICY_SOLVENCY_TRUE_CRITERION ||
+      solvent.criteria.false !== POLICY_SOLVENCY_FALSE_CRITERION
+    ) {
+      throw new HttpError(
+        400,
+        "invalid_policy_evaluate",
+        `${policyId}_solvent does not match the fixed Noul question`,
+      );
+    }
+
+    const profitBand = value.questions[`${policyId}_profit_band`];
+    if (
+      !isRecord(profitBand) ||
+      !hasExactFields(profitBand, ["type", "instructions", "criteria"]) ||
+      profitBand.type !== "score" ||
+      !isRecord(profitBand.instructions) ||
+      !hasExactFields(profitBand.instructions, ["policyId", "question"]) ||
+      profitBand.instructions.policyId !== policyId ||
+      profitBand.instructions.question !== POLICY_PROFIT_QUESTION ||
+      !Array.isArray(profitBand.criteria) ||
+      profitBand.criteria.length !== POLICY_PROFIT_CRITERIA.length ||
+      profitBand.criteria.some(
+        (criterion, index) => criterion !== POLICY_PROFIT_CRITERIA[index],
+      )
+    ) {
+      throw new HttpError(
+        400,
+        "invalid_policy_evaluate",
+        `${policyId}_profit_band does not match the fixed score question`,
+      );
+    }
+  }
+
+  return value as unknown as PolicyEvaluateRequest;
+}
+
 function inferenceStreamResponse(
   stream: ReadableStream,
   localDevOpen: boolean,
@@ -496,8 +937,219 @@ async function decisionSelectRoute(
   });
 }
 
+async function planVerifyRoute(
+  request: Request,
+  env: RuntimeEnv,
+): Promise<Response> {
+  const admin = await requireAdmin(request, env);
+  const input = parsePlanVerifyRequest(
+    parseJsonBody(await readBoundedBody(request, MAX_DECISION_SELECT_BODY_BYTES)),
+  );
+  const result = await (env.AI as unknown as ClefBinding).run(DECISION_MODEL, {
+    model: "clef",
+    state: input.state,
+    questions: input.questions,
+  });
+  return jsonResponse(toJsonValue(result), 200, {
+    ...adminHeaders(admin.localDevOpen),
+    "Cache-Control": "no-store",
+  });
+}
+
+async function policyEvaluateRoute(
+  request: Request,
+  env: RuntimeEnv,
+): Promise<Response> {
+  const admin = await requireAdmin(request, env);
+  const input = parsePolicyEvaluateRequest(
+    parseJsonBody(await readBoundedBody(request, MAX_DECISION_SELECT_BODY_BYTES)),
+  );
+  const result = await (env.AI as unknown as ClefBinding).run(DECISION_MODEL, {
+    model: "clef",
+    state: input.state,
+    questions: input.questions,
+  });
+  return jsonResponse(toJsonValue(result), 200, {
+    ...adminHeaders(admin.localDevOpen),
+    "Cache-Control": "no-store",
+  });
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function hasExactFields(value: Record<string, unknown>, fields: string[]): boolean {
+  return (
+    Object.keys(value).length === fields.length &&
+    Object.keys(value).every((key) => fields.includes(key))
+  );
+}
+
+function isSafeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value);
+}
+
+function isBoundedInteger(
+  value: unknown,
+  minimum: number,
+  maximum: number,
+): value is number {
+  return isSafeInteger(value) && value >= minimum && value <= maximum;
+}
+
+function isBoundedId(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(value)
+  );
+}
+
+function isPlanAction(value: unknown): value is Record<string, unknown> {
+  if (
+    !isRecord(value) ||
+    !hasExactFields(value, ["type", "params"]) ||
+    typeof value.type !== "string" ||
+    !PLAN_ACTION_TYPES.has(value.type) ||
+    !isRecord(value.params)
+  ) {
+    return false;
+  }
+  const params = value.params;
+  switch (value.type) {
+    case "set_menu_price":
+      return (
+        hasExactFields(params, ["dishId", "priceCents"]) &&
+        isBoundedId(params.dishId) &&
+        isBoundedInteger(params.priceCents, 500, 5_000)
+      );
+    case "purchase_inventory":
+      return (
+        hasExactFields(params, ["ingredientId", "quantity"]) &&
+        isBoundedId(params.ingredientId) &&
+        isBoundedInteger(params.quantity, 1, 500)
+      );
+    case "set_staff":
+      return (
+        hasExactFields(params, ["role", "count"]) &&
+        (params.role === "chef" || params.role === "server") &&
+        isBoundedInteger(params.count, 0, 10)
+      );
+    case "set_marketing":
+      return (
+        hasExactFields(params, ["budgetCents"]) &&
+        isBoundedInteger(params.budgetCents, 0, 5_000)
+      );
+    case "invest":
+      return (
+        hasExactFields(params, ["kind"]) &&
+        (params.kind === "capacity" || params.kind === "quality")
+      );
+    case "borrow":
+      return (
+        hasExactFields(params, ["amountCents"]) &&
+        isBoundedInteger(params.amountCents, 5_000, 100_000)
+      );
+    case "repay_loan":
+      return (
+        hasExactFields(params, ["amountCents"]) &&
+        isBoundedInteger(params.amountCents, 1, 100_000)
+      );
+    case "schedule_maintenance":
+    case "repair_equipment":
+      return (
+        hasExactFields(params, ["assetId"]) &&
+        (params.assetId === "kitchen" || params.assetId === "refrigeration")
+      );
+    case "train_staff":
+      return (
+        hasExactFields(params, ["role", "budgetCents"]) &&
+        (params.role === "chef" || params.role === "server") &&
+        isBoundedInteger(params.budgetCents, 500, 5_000)
+      );
+    case "expedite_delivery":
+      return hasExactFields(params, ["orderId"]) && isBoundedId(params.orderId);
+    default:
+      return false;
+  }
+}
+
+function isValidationIssue(value: unknown): value is Record<string, unknown> {
+  return (
+    isRecord(value) &&
+    hasExactFields(value, [
+      "stage",
+      "code",
+      "message",
+      "blocking",
+      "action_index",
+      "action_type",
+    ]) &&
+    typeof value.stage === "string" &&
+    ["parse", "envelope", "schema", "feasibility", "policy"].includes(
+      value.stage,
+    ) &&
+    typeof value.code === "string" &&
+    typeof value.message === "string" &&
+    typeof value.blocking === "boolean" &&
+    (value.action_index === null ||
+      (isSafeInteger(value.action_index) && value.action_index >= 0)) &&
+    (value.action_type === null ||
+      (typeof value.action_type === "string" &&
+        PLAN_ACTION_TYPES.has(value.action_type)))
+  );
+}
+
+function isActionPreview(
+  value: unknown,
+  index: number,
+  action: unknown,
+): value is Record<string, unknown> {
+  if (!isRecord(value) || !isPlanAction(action)) {
+    return false;
+  }
+  return (
+    hasExactFields(value, [
+      "action_index",
+      "action_type",
+      "estimated_cost_cents",
+      "cash_before_cents",
+      "cash_after_cents",
+      "details",
+    ]) &&
+    value.action_index === index &&
+    value.action_type === action.type &&
+    isSafeInteger(value.estimated_cost_cents) &&
+    isSafeInteger(value.cash_before_cents) &&
+    isSafeInteger(value.cash_after_cents) &&
+    isRecord(value.details)
+  );
+}
+
+function jsonStructurallyEqual(left: unknown, right: unknown): boolean {
+  if (Array.isArray(left)) {
+    return (
+      Array.isArray(right) &&
+      left.length === right.length &&
+      left.every((item, index) => jsonStructurallyEqual(item, right[index]))
+    );
+  }
+  if (isRecord(left)) {
+    if (!isRecord(right)) {
+      return false;
+    }
+    const leftKeys = Object.keys(left);
+    const rightKeys = Object.keys(right);
+    return (
+      leftKeys.length === rightKeys.length &&
+      leftKeys.every(
+        (key) =>
+          Object.prototype.hasOwnProperty.call(right, key) &&
+          jsonStructurallyEqual(left[key], right[key]),
+      )
+    );
+  }
+  return left === right;
 }
 
 function validateRestaurantId(value: unknown): value is string {
@@ -620,16 +1272,38 @@ async function secretsEqual(provided: string, expected: string): Promise<boolean
   return crypto.subtle.timingSafeEqual(providedDigest, expectedDigest);
 }
 
+async function secretDigestEqual(provided: string, expectedDigest: string): Promise<boolean> {
+  if (!/^[0-9a-f]{64}$/.test(expectedDigest)) {
+    return false;
+  }
+  const providedDigest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(provided),
+  );
+  const expected = Uint8Array.from(
+    expectedDigest.match(/.{2}/g) ?? [],
+    (byte) => Number.parseInt(byte, 16),
+  );
+  return crypto.subtle.timingSafeEqual(providedDigest, expected);
+}
+
 async function requireAdmin(
   request: Request,
   env: RuntimeEnv,
 ): Promise<{ localDevOpen: boolean }> {
-  if (!env.BENCHMARK_ADMIN_TOKEN) {
+  const expectedToken = env.BENCHMARK_ADMIN_TOKEN;
+  const expectedDigest = env.BENCHMARK_ADMIN_TOKEN_SHA256;
+  if (!expectedToken && !expectedDigest) {
     return { localDevOpen: true };
   }
 
   const provided = extractBearerToken(request);
-  if (!provided || !(await secretsEqual(provided, env.BENCHMARK_ADMIN_TOKEN))) {
+  const authorized =
+    provided !== null &&
+    (expectedToken
+      ? await secretsEqual(provided, expectedToken)
+      : await secretDigestEqual(provided, expectedDigest ?? ""));
+  if (!authorized) {
     throw new HttpError(401, "admin_unauthorized", "Admin token is required");
   }
   return { localDevOpen: false };
@@ -1014,6 +1688,12 @@ export default {
       }
       if (request.method === "POST" && url.pathname === "/api/decision-select") {
         return await decisionSelectRoute(request, runtimeEnv);
+      }
+      if (request.method === "POST" && url.pathname === "/api/plan-verify") {
+        return await planVerifyRoute(request, runtimeEnv);
+      }
+      if (request.method === "POST" && url.pathname === "/api/policy-evaluate") {
+        return await policyEvaluateRoute(request, runtimeEnv);
       }
       if (request.method === "POST" && url.pathname === "/api/games") {
         return await createGameRoute(request, runtimeEnv);

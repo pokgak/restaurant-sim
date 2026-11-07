@@ -158,6 +158,164 @@ function decisionSelectBody(candidateCount = 3): Record<string, unknown> {
   };
 }
 
+function planVerifyBody(): Record<string, unknown> {
+  const actions = [
+    {
+      type: "purchase_inventory",
+      params: { ingredientId: "staples", quantity: 4 },
+    },
+  ];
+  return {
+    model: "@cf/cloudflare/clef",
+    state: {
+      contractVersion: "restaurant-sim-plan-verifier-v1",
+      observation: {
+        tick: 12,
+        restaurant: { cashCents: 25_000, inventory: { staples: 1 } },
+      },
+      outcomeFeedback: null,
+      proposedPlan: {
+        actions,
+        note: "Replenish staples before the next service tick.",
+      },
+      deterministicReview: {
+        submittable: true,
+        validatedActions: [
+          {
+            params: { quantity: 4, ingredientId: "staples" },
+            type: "purchase_inventory",
+          },
+        ],
+        issues: [],
+        previews: [
+          {
+            action_index: 0,
+            action_type: "purchase_inventory",
+            estimated_cost_cents: 400,
+            cash_before_cents: 25_000,
+            cash_after_cents: 24_600,
+            details: {},
+          },
+        ],
+        projected: { cashCents: 24_600 },
+      },
+    },
+    questions: {
+      material_state_misread: {
+        type: "noul",
+        instructions:
+          "Does proposedPlan rely on a factual assumption contradicted by observation or " +
+          "deterministicReview, where that contradiction could materially change whether " +
+          "its actions should execute now?",
+        criteria: {
+          true:
+            "A stated or implied assumption about liquidity, recurring cost, inventory or " +
+            "delivery timing, equipment, staffing pipeline, capacity, or action ordering " +
+            "conflicts with supplied evidence.",
+          false:
+            "No material contradiction is supported. Uncertainty about hidden future " +
+            "events or the tick-84 result alone does not count.",
+        },
+      },
+    },
+  };
+}
+
+function policyEvaluateBody(candidateCount: 5 | 10 = 5): Record<string, unknown> {
+  const policyIds = [
+    "balanced",
+    "cash_guard",
+    "maintenance_first",
+    "lean_operator",
+    "moderate_growth",
+    "inventory_buffer",
+    "price_power",
+    "workforce_quality",
+    "debt_averse",
+    "growth_credit",
+  ].slice(0, candidateCount);
+  const candidates = policyIds.map((policyId, index) => {
+    const actions = [
+      {
+        type: "set_marketing",
+        params: { budgetCents: (index + 1) * 100 },
+      },
+    ];
+    return {
+      policyId,
+      policyVersion: "restaurant-sim-policy-v1",
+      description: `Deterministic ${policyId} continuation through tick 84.`,
+      parameters: { marketingBudgetCents: (index + 1) * 100 },
+      actions,
+      previews: [
+        {
+          action_index: 0,
+          action_type: "set_marketing",
+          estimated_cost_cents: 0,
+          cash_before_cents: 25_000,
+          cash_after_cents: 25_000,
+          details: { policyId },
+        },
+      ],
+      projected: { finalOperatingProfitCents: index * 10_000 },
+    };
+  });
+  const profitCriteria = [
+    "Below -500000 cents",
+    "-500000 to -300001 cents",
+    "-300000 to -200001 cents",
+    "-200000 to -100001 cents",
+    "-100000 to -1 cents",
+    "0 to 99999 cents",
+    "At least 100000 cents",
+  ];
+  const questions = Object.fromEntries(
+    policyIds.flatMap((policyId) => [
+      [
+        `${policyId}_solvent`,
+        {
+          type: "noul",
+          instructions: {
+            policyId,
+            question:
+              "Will this candidate policy keep the restaurant solvent through tick 84?",
+          },
+          criteria: {
+            true: "The restaurant is not bankrupt at tick 84.",
+            false: "The restaurant becomes bankrupt at any tick through tick 84.",
+          },
+        },
+      ],
+      [
+        `${policyId}_profit_band`,
+        {
+          type: "score",
+          instructions: {
+            policyId,
+            question:
+              "What cumulative operating profit band will this candidate policy finish in at tick 84?",
+          },
+          criteria: profitCriteria,
+        },
+      ],
+    ]),
+  );
+  return {
+    model: "@cf/cloudflare/clef",
+    state: {
+      contractVersion: "restaurant-sim-policy-evaluator-v1",
+      candidateCount,
+      benchmarkObjective:
+        "Evaluate each candidate policy as a complete deterministic continuation from the current observation through tick 84. First estimate whether the restaurant remains solvent through tick 84. Separately estimate its final cumulative operating profit band at tick 84. Do not optimize revenue, cash, reputation, survival duration, or action count except insofar as they improve solvency and cumulative operating profit.",
+      terminalTick: 84,
+      observation: { tick: 12, restaurant: { cashCents: 25_000 } },
+      outcomeFeedback: null,
+      candidates,
+    },
+    questions,
+  };
+}
+
 async function command(
   game: CreatedGame,
   seat: SeatCredential,
@@ -378,6 +536,392 @@ describe("restaurant simulation API", () => {
           state: expect.objectContaining({ candidateCount }),
         }),
       );
+    }
+    run.mockRestore();
+  });
+
+  it("locks plan verification to the deterministic Clef Noul contract", async () => {
+    const missingToken = await api("/api/plan-verify", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(planVerifyBody()),
+    });
+    await expectErrorCode(missingToken, 401, "admin_unauthorized");
+
+    const wrongModel = planVerifyBody();
+    wrongModel.model = "@cf/cloudflare/clef-flash";
+    await expectErrorCode(
+      await api("/api/plan-verify", {
+        method: "POST",
+        headers: {
+          ...bearer(ADMIN_TOKEN),
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(wrongModel),
+      }),
+      400,
+      "invalid_plan_verify",
+    );
+
+    const wrongVersion = planVerifyBody();
+    (wrongVersion.state as Record<string, unknown>).contractVersion =
+      "restaurant-sim-plan-verifier-v2";
+    await expectErrorCode(
+      await api("/api/plan-verify", {
+        method: "POST",
+        headers: {
+          ...bearer(ADMIN_TOKEN),
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(wrongVersion),
+      }),
+      400,
+      "invalid_plan_verify",
+    );
+
+    const wrongQuestion = planVerifyBody();
+    const question = (wrongQuestion.questions as Record<string, unknown>)
+      .material_state_misread as Record<string, unknown>;
+    question.type = "choice";
+    await expectErrorCode(
+      await api("/api/plan-verify", {
+        method: "POST",
+        headers: {
+          ...bearer(ADMIN_TOKEN),
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(wrongQuestion),
+      }),
+      400,
+      "invalid_plan_verify",
+    );
+
+    const malformedReview = planVerifyBody();
+    const review = (malformedReview.state as Record<string, unknown>)
+      .deterministicReview as Record<string, unknown>;
+    review.submittable = false;
+    await expectErrorCode(
+      await api("/api/plan-verify", {
+        method: "POST",
+        headers: {
+          ...bearer(ADMIN_TOKEN),
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(malformedReview),
+      }),
+      400,
+      "invalid_plan_verify",
+    );
+
+    const mismatchedActions = planVerifyBody();
+    const mismatchedReview = (mismatchedActions.state as Record<string, unknown>)
+      .deterministicReview as Record<string, unknown>;
+    mismatchedReview.validatedActions = [];
+    await expectErrorCode(
+      await api("/api/plan-verify", {
+        method: "POST",
+        headers: {
+          ...bearer(ADMIN_TOKEN),
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(mismatchedActions),
+      }),
+      400,
+      "invalid_plan_verify",
+    );
+
+    const malformedAction = planVerifyBody();
+    const malformedPlan = (malformedAction.state as Record<string, unknown>)
+      .proposedPlan as Record<string, unknown>;
+    malformedPlan.actions = [null];
+    const malformedActionReview = (
+      malformedAction.state as Record<string, unknown>
+    ).deterministicReview as Record<string, unknown>;
+    malformedActionReview.validatedActions = [null];
+    await expectErrorCode(
+      await api("/api/plan-verify", {
+        method: "POST",
+        headers: {
+          ...bearer(ADMIN_TOKEN),
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(malformedAction),
+      }),
+      400,
+      "invalid_plan_verify",
+    );
+
+    const malformedParameters = planVerifyBody();
+    const malformedParametersState = malformedParameters.state as Record<
+      string,
+      unknown
+    >;
+    const malformedParametersPlan = malformedParametersState.proposedPlan as Record<
+      string,
+      unknown
+    >;
+    const invalidBorrow = { type: "borrow", params: { amountCents: 1 } };
+    malformedParametersPlan.actions = [invalidBorrow];
+    const malformedParametersReview =
+      malformedParametersState.deterministicReview as Record<string, unknown>;
+    malformedParametersReview.validatedActions = [invalidBorrow];
+    malformedParametersReview.previews = [
+      {
+        action_index: 0,
+        action_type: "borrow",
+        estimated_cost_cents: 0,
+        cash_before_cents: 25_000,
+        cash_after_cents: 25_001,
+        details: {},
+      },
+    ];
+    await expectErrorCode(
+      await api("/api/plan-verify", {
+        method: "POST",
+        headers: {
+          ...bearer(ADMIN_TOKEN),
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(malformedParameters),
+      }),
+      400,
+      "invalid_plan_verify",
+    );
+
+    const malformedPreview = planVerifyBody();
+    const malformedPreviewReview = (
+      malformedPreview.state as Record<string, unknown>
+    ).deterministicReview as Record<string, unknown>;
+    malformedPreviewReview.previews = [null];
+    await expectErrorCode(
+      await api("/api/plan-verify", {
+        method: "POST",
+        headers: {
+          ...bearer(ADMIN_TOKEN),
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(malformedPreview),
+      }),
+      400,
+      "invalid_plan_verify",
+    );
+  });
+
+  it("relays one valid plan-verifier Noul request to Clef unchanged", async () => {
+    const ai = env.AI as unknown as {
+      run(model: string, input: unknown): Promise<unknown>;
+    };
+    const clefResult = {
+      model: "clef",
+      answers: {
+        material_state_misread: {
+          type: "noul",
+          noul: 0.08,
+          confidence: 0.92,
+        },
+      },
+      usage: { input_tokens: 240, output_tokens: 12 },
+    };
+    const run = vi.spyOn(ai, "run").mockResolvedValue(clefResult);
+    const requestBody = planVerifyBody();
+
+    const response = await api("/api/plan-verify", {
+      method: "POST",
+      headers: {
+        ...bearer(ADMIN_TOKEN),
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(requestBody),
+    });
+
+    expect(response.status).toBe(200);
+    expect(response.headers.get("Cache-Control")).toBe("no-store");
+    expect(response.headers.get("Content-Type")).toContain("application/json");
+    expect(await response.json()).toEqual(clefResult);
+    expect(run).toHaveBeenCalledOnce();
+    expect(run).toHaveBeenCalledWith("@cf/cloudflare/clef", {
+      model: "clef",
+      state: requestBody.state,
+      questions: requestBody.questions,
+    });
+    run.mockRestore();
+  });
+
+  it("locks policy evaluation to the fixed policy and question contract", async () => {
+    const missingToken = await api("/api/policy-evaluate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(policyEvaluateBody()),
+    });
+    await expectErrorCode(missingToken, 401, "admin_unauthorized");
+
+    const invalidBodies: Array<[string, Record<string, unknown>]> = [];
+
+    const wrongModel = policyEvaluateBody();
+    wrongModel.model = "@cf/cloudflare/clef-flash";
+    invalidBodies.push(["model", wrongModel]);
+
+    const wrongCount = policyEvaluateBody();
+    (wrongCount.state as Record<string, unknown>).candidateCount = 6;
+    invalidBodies.push(["candidate count", wrongCount]);
+
+    const wrongOrder = policyEvaluateBody();
+    const wrongOrderCandidates = (
+      wrongOrder.state as { candidates: unknown[] }
+    ).candidates;
+    [wrongOrderCandidates[0], wrongOrderCandidates[1]] = [
+      wrongOrderCandidates[1],
+      wrongOrderCandidates[0],
+    ];
+    invalidBodies.push(["candidate order", wrongOrder]);
+
+    const extraTopLevelField = policyEvaluateBody();
+    extraTopLevelField.note = "not part of the contract";
+    invalidBodies.push(["top-level fields", extraTopLevelField]);
+
+    const extraStateField = policyEvaluateBody();
+    (extraStateField.state as Record<string, unknown>).selectionOutcome = "other";
+    invalidBodies.push(["state fields", extraStateField]);
+
+    const extraCandidateField = policyEvaluateBody();
+    const candidateWithNote = (
+      extraCandidateField.state as { candidates: Array<Record<string, unknown>> }
+    ).candidates[0];
+    candidateWithNote.note = "unbounded notes are not accepted";
+    invalidBodies.push(["candidate fields", extraCandidateField]);
+
+    const blankDescription = policyEvaluateBody();
+    (
+      blankDescription.state as {
+        candidates: Array<Record<string, unknown>>;
+      }
+    ).candidates[0].description = "   ";
+    invalidBodies.push(["blank description", blankDescription]);
+
+    const oversizedDescription = policyEvaluateBody();
+    (
+      oversizedDescription.state as {
+        candidates: Array<Record<string, unknown>>;
+      }
+    ).candidates[0].description = "x".repeat(2_001);
+    invalidBodies.push(["oversized description", oversizedDescription]);
+
+    const malformedAction = policyEvaluateBody();
+    const malformedActionCandidate = (
+      malformedAction.state as {
+        candidates: Array<{ actions: unknown[] }>;
+      }
+    ).candidates[0];
+    malformedActionCandidate.actions = [
+      { type: "borrow", params: { amountCents: 1, note: "invalid field" } },
+    ];
+    invalidBodies.push(["action shape", malformedAction]);
+
+    const malformedPreview = policyEvaluateBody();
+    const malformedPreviewCandidate = (
+      malformedPreview.state as {
+        candidates: Array<{ previews: Array<Record<string, unknown>> }>;
+      }
+    ).candidates[0];
+    malformedPreviewCandidate.previews[0].action_type = "borrow";
+    invalidBodies.push(["preview shape", malformedPreview]);
+
+    const extraQuestion = policyEvaluateBody();
+    (extraQuestion.questions as Record<string, unknown>).other = {
+      type: "noul",
+      instructions: "Do something else?",
+    };
+    invalidBodies.push(["question fields", extraQuestion]);
+
+    const wrongSolvencyQuestion = policyEvaluateBody();
+    const solvencyQuestion = (
+      wrongSolvencyQuestion.questions as Record<string, Record<string, unknown>>
+    ).balanced_solvent;
+    (solvencyQuestion.instructions as Record<string, unknown>).question =
+      "Will it survive?";
+    solvencyQuestion.explanation = "not part of the question contract";
+    invalidBodies.push(["solvency question", wrongSolvencyQuestion]);
+
+    const wrongProfitCriteria = policyEvaluateBody();
+    const profitQuestion = (
+      wrongProfitCriteria.questions as Record<string, Record<string, unknown>>
+    ).balanced_profit_band;
+    (profitQuestion.criteria as unknown[]).reverse();
+    invalidBodies.push(["profit criteria order", wrongProfitCriteria]);
+
+    for (const [label, body] of invalidBodies) {
+      const response = await api("/api/policy-evaluate", {
+        method: "POST",
+        headers: {
+          ...bearer(ADMIN_TOKEN),
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(body),
+      });
+      expect(response.status, label).toBe(400);
+      expect(await response.json(), label).toMatchObject({
+        error: { code: "invalid_policy_evaluate" },
+      });
+    }
+
+    const oversizedBody = await api("/api/policy-evaluate", {
+      method: "POST",
+      headers: {
+        ...bearer(ADMIN_TOKEN),
+        "Content-Type": "application/json",
+      },
+      body: "x".repeat(1024 * 1024 + 1),
+    });
+    await expectErrorCode(oversizedBody, 413, "body_too_large");
+  });
+
+  it("relays valid 5- and 10-policy evaluations to Clef unchanged", async () => {
+    const ai = env.AI as unknown as {
+      run(model: string, input: unknown): Promise<unknown>;
+    };
+    const clefResult = {
+      model: "clef",
+      answers: {
+        balanced_solvent: { type: "noul", noul: 0.91, confidence: 0.8 },
+        balanced_profit_band: {
+          type: "score",
+          score: 5.25,
+          confidence: 0.7,
+          probabilities: [0.01, 0.02, 0.04, 0.08, 0.1, 0.4, 0.35],
+        },
+      },
+      usage: { input_tokens: 900, output_tokens: 80 },
+    };
+    const run = vi.spyOn(ai, "run").mockResolvedValue(clefResult);
+    const bodies = [policyEvaluateBody(5), policyEvaluateBody(10)];
+
+    for (const body of bodies) {
+      const response = await api("/api/policy-evaluate", {
+        method: "POST",
+        headers: {
+          ...bearer(ADMIN_TOKEN),
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(body),
+      });
+
+      expect(response.status).toBe(200);
+      expect(response.headers.get("Cache-Control")).toBe("no-store");
+      expect(response.headers.get("Content-Type")).toContain("application/json");
+      expect(await response.json()).toEqual(clefResult);
+      const candidateCount = (body.state as { candidateCount: number }).candidateCount;
+      expect(Object.keys(body.questions as Record<string, unknown>)).toHaveLength(
+        candidateCount * 2,
+      );
+    }
+
+    expect(run).toHaveBeenCalledTimes(2);
+    for (const [index, body] of bodies.entries()) {
+      expect(run).toHaveBeenNthCalledWith(index + 1, "@cf/cloudflare/clef", {
+        model: "clef",
+        state: body.state,
+        questions: body.questions,
+      });
     }
     run.mockRestore();
   });

@@ -15,7 +15,7 @@ npm run dev
 
 The production import resolves the workspace's `@restaurant-sim/sim` package. API tests alias that import through `test/fixtures/sim.ts`, which re-exports the real workspace package so integration tests and production compile against the same frozen engine contract.
 
-`BENCHMARK_ADMIN_TOKEN` is optional for local development. When it is absent, create, control, and export routes are deliberately open and return `X-Admin-Auth: local-dev-open`. **This is local-dev behavior, not production authentication. Do not deploy without setting the secret.** Set it locally in an untracked `.dev.vars` file or with Wrangler secret management. When present, send it as `Authorization: Bearer <token>`; comparison hashes both values and uses constant-time Web Crypto comparison.
+`BENCHMARK_ADMIN_TOKEN` is optional for local development. When it and `BENCHMARK_ADMIN_TOKEN_SHA256` are absent, create, control, and export routes are deliberately open and return `X-Admin-Auth: local-dev-open`. **This is local-dev behavior, not production authentication. Do not deploy without setting one of them.** Set the token locally in an untracked `.dev.vars` file or with Wrangler secret management. A deployment system that cannot transmit secrets can instead bind the lowercase SHA-256 digest as `BENCHMARK_ADMIN_TOKEN_SHA256`; use this only with a high-entropy token. When present, send the original token as `Authorization: Bearer <token>`; comparison uses constant-time Web Crypto primitives.
 
 Seat tokens are separate from the admin token. They are returned only by game creation, stored only as SHA-256 digests, and compared as fixed-size digests. Losing a seat token requires creating a new game in this MVP.
 
@@ -166,12 +166,110 @@ field and returns the typed answer and usage. It rejects every other model, ques
 candidate count, or candidate ordering. The benchmark runner validates the response
 and archives the exact request, probabilities, route, latency, and cost.
 
+## Private plan verifier
+
+`POST /api/plan-verify` is a separate admin-protected Clef relay. Its JSON body is
+limited to 1 MiB and must contain exactly `model`, `state`, and `questions`:
+
+```json
+{
+  "model": "@cf/cloudflare/clef",
+  "state": {
+    "contractVersion": "restaurant-sim-plan-verifier-v1",
+    "observation": {},
+    "outcomeFeedback": null,
+    "proposedPlan": { "actions": [], "note": "" },
+    "deterministicReview": {
+      "submittable": true,
+      "validatedActions": [],
+      "issues": [],
+      "previews": [],
+      "projected": {}
+    }
+  },
+  "questions": {
+    "material_state_misread": {
+      "type": "noul",
+      "instructions": "Does proposedPlan rely on a factual assumption contradicted by observation or deterministicReview, where that contradiction could materially change whether its actions should execute now?",
+      "criteria": {
+        "true": "A stated or implied assumption about liquidity, recurring cost, inventory or delivery timing, equipment, staffing pipeline, capacity, or action ordering conflicts with supplied evidence.",
+        "false": "No material contradiction is supported. Uncertainty about hidden future events or the tick-84 result alone does not count."
+      }
+    }
+  }
+}
+```
+
+`observation` must be an object and `outcomeFeedback` must be an object or `null`.
+`proposedPlan` has exactly `actions` and `note`, with 0-5 actions. The
+`deterministicReview` object is the exact `DecisionReview.feedback()` shape shown
+above: it must be submittable, and its `validatedActions` must structurally equal
+`proposedPlan.actions`. The fixed Noul question is the only accepted question.
+
+The Worker relays the validated request as `{ "model": "clef", "state": ...,
+"questions": ... }`, then returns the complete Workers AI JSON response with
+`Cache-Control: no-store`. Caller-side benchmark code owns the 0.3/0.7 routing
+decision based on that response; the Worker only validates and relays and does not
+apply a routing threshold.
+
+## Private policy evaluator
+
+`POST /api/policy-evaluate` is an admin-protected, 1 MiB-bounded relay for the pure
+decision model `@cf/cloudflare/clef`; it does not invoke a generative model. The body
+has exactly `model`, `state`, and `questions`, with `model` fixed to
+`@cf/cloudflare/clef`. `state` has exactly these fields:
+
+```json
+{
+  "contractVersion": "restaurant-sim-policy-evaluator-v1",
+  "candidateCount": 5,
+  "benchmarkObjective": "Evaluate each candidate policy as a complete deterministic continuation from the current observation through tick 84. First estimate whether the restaurant remains solvent through tick 84. Separately estimate its final cumulative operating profit band at tick 84. Do not optimize revenue, cash, reputation, survival duration, or action count except insofar as they improve solvency and cumulative operating profit.",
+  "terminalTick": 84,
+  "observation": {},
+  "outcomeFeedback": null,
+  "candidates": []
+}
+```
+
+`candidateCount` is 5 or 10. The first five policy IDs, in order, are `balanced`,
+`cash_guard`, `maintenance_first`, `lean_operator`, and `moderate_growth`. The
+10-policy form appends `inventory_buffer`, `price_power`, `workforce_quality`,
+`debt_averse`, and `growth_credit`. Every candidate has exactly `policyId`,
+`policyVersion`, `description`, `parameters`, `actions`, `previews`, and `projected`.
+`policyVersion` is `restaurant-sim-policy-v1`; descriptions contain 1-2,000
+characters; `parameters` and `projected` are objects. `actions` contains 0-5 strict
+canonical plan actions. `previews` has the same length and each entry must be the
+matching strict action preview.
+
+Each policy has exactly two questions. `<policyId>_solvent` is a `noul` question
+with instructions `{ "policyId": "<policyId>", "question": "Will
+this candidate policy keep the restaurant solvent through tick 84?" }` and criteria
+`{ "true": "The restaurant is not bankrupt at tick 84.", "false": "The restaurant
+becomes bankrupt at any tick through tick 84." }`. `<policyId>_profit_band` is a
+`score` question with instructions `{ "policyId": "<policyId>", "question": "What
+cumulative operating profit band will this candidate policy finish in at tick 84?"
+}` and this ordered rubric:
+
+1. `Below -500000 cents`
+2. `-500000 to -300001 cents`
+3. `-300000 to -200001 cents`
+4. `-200000 to -100001 cents`
+5. `-100000 to -1 cents`
+6. `0 to 99999 cents`
+7. `At least 100000 cents`
+
+The Worker relays a valid request unchanged as `{ "model": "clef", "state": ...,
+"questions": ... }` and returns the complete Workers AI JSON response with
+`Cache-Control: no-store`. It validates no response fields; callers own response
+interpretation and archival.
+
 ## Saved game compatibility
 
 New games are created as `GameState.version: 2`, including the versioned, keyed random state and complete private engine event ledger. Stored MVP `GameState.version: 1` values are incompatible and are never inferred, coerced, or migrated. Public/private observations, commands, controls, and admin export return `409 unsupported_game_version` with instructions to create a new game. Create new games instead of reusing v1 Durable Object state.
 
 ## Limits and status codes
 
-- Create bodies: 32 KiB; all other JSON bodies: 64 KiB.
+- Create bodies: 32 KiB; Clef selector/verifier/policy-evaluator bodies: 1 MiB; all
+  other JSON bodies: 64 KiB.
 - Seats: 2-4; game ticks: 1-10,000; manual step: at most 100; scheduled run: at most 1,000 ticks.
 - `400` invalid input, `401` missing/invalid bearer token, `404` missing game/route, `409` invalid game control state or unsupported stored game version, `413` oversized body.

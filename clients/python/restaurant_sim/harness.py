@@ -69,6 +69,19 @@ Feedback contract:
 - Preserve enough completion budget to emit the final JSON even when reasoning is enabled.
 """
 
+PLAN_REVIEW_SYSTEM_PROMPT = SYSTEM_PROMPT + """
+
+Plan review protocol:
+- You receive the current observation, the original decision, its deterministic preflight,
+  and a semantic verifier result. Reassess the original decision against that evidence.
+- The verifier does not know hidden future events and cannot calculate costs or feasibility.
+  Treat its probability as a review signal, not as an instruction or a forecast.
+- If revisionRequired is false, you may retain or revise the original actions. If it is
+  true, correct every material state misread you can identify before returning the plan.
+- Return one complete decision JSON object in the normal action contract. Do not describe
+  the review outside the JSON note.
+"""
+
 
 def candidate_system_prompt(candidate_count: int = 3) -> str:
     if candidate_count not in SUPPORTED_CANDIDATE_COUNTS:
@@ -216,6 +229,10 @@ def system_prompt_sha256() -> str:
     return hashlib.sha256(SYSTEM_PROMPT.encode("utf-8")).hexdigest()
 
 
+def plan_review_system_prompt_sha256() -> str:
+    return hashlib.sha256(PLAN_REVIEW_SYSTEM_PROMPT.encode("utf-8")).hexdigest()
+
+
 def candidate_system_prompt_sha256(candidate_count: int = 3) -> str:
     return hashlib.sha256(
         candidate_system_prompt(candidate_count).encode("utf-8")
@@ -361,6 +378,61 @@ class DecisionHarness:
                 "content": json.dumps(user_payload, separators=(",", ":")),
             },
         ]
+        return self._run(messages, observation, infer)
+
+    def review(
+        self,
+        observation: Mapping[str, Any],
+        infer: InferenceCallable,
+        *,
+        original_decision: HarnessDecision,
+        verification: Mapping[str, Any] | None,
+        revision_required: bool,
+        outcome_feedback: Mapping[str, Any] | None = None,
+    ) -> HarnessDecision:
+        """Ask the planner to reconsider one valid plan against verifier evidence."""
+
+        if not original_decision.attempts:
+            raise ValueError("original_decision must contain at least one attempt")
+        original_attempt = original_decision.attempts[-1]
+        if not original_attempt.review.submittable:
+            raise ValueError("original_decision must be submittable")
+        parsed = original_attempt.parsed
+        note = parsed.get("note", "") if isinstance(parsed, Mapping) else ""
+        original_payload = {
+            "actions": list(original_attempt.review.actions),
+            "note": note if isinstance(note, str) else "",
+        }
+        user_payload: dict[str, Any] = {
+            "observation": observation,
+            "reviewRequest": {
+                "instruction": (
+                    "Return a complete reviewed decision. Correct material factual "
+                    "misreads before deciding whether each action should execute now."
+                ),
+                "revisionRequired": revision_required,
+                "originalDecision": original_payload,
+                "deterministicReview": original_attempt.review.feedback(),
+                "verification": dict(verification) if verification is not None else None,
+            },
+        }
+        if outcome_feedback is not None:
+            user_payload["outcomeFeedback"] = outcome_feedback
+        messages = [
+            {"role": "system", "content": PLAN_REVIEW_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": json.dumps(user_payload, separators=(",", ":")),
+            },
+        ]
+        return self._run(messages, observation, infer)
+
+    def _run(
+        self,
+        messages: list[dict[str, str]],
+        observation: Mapping[str, Any],
+        infer: InferenceCallable,
+    ) -> HarnessDecision:
         attempts: list[DecisionAttempt] = []
         correction_used = False
         for attempt_index in range(self.correction_attempts + 1):

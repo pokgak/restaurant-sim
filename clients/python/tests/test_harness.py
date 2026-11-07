@@ -6,6 +6,7 @@ import unittest
 from typing import Any
 
 from restaurant_sim.harness import (
+    PLAN_REVIEW_SYSTEM_PROMPT,
     SYSTEM_PROMPT,
     CandidateDecisionHarness,
     DecisionHarness,
@@ -139,6 +140,68 @@ class DecisionHarnessTest(unittest.TestCase):
         self.assertEqual(decision.metrics["envelopeValidAttempts"], 2)
         self.assertEqual(decision.metrics["schemaValidAttempts"], 1)
         self.assertEqual(decision.metrics["feasibleAttempts"], 1)
+
+    def test_plan_review_preserves_evidence_and_returns_a_fresh_valid_decision(self) -> None:
+        original = DecisionHarness().decide(
+            observation(),
+            lambda _: provider_response(
+                json.dumps(
+                    {
+                        "actions": [
+                            {
+                                "type": "set_marketing",
+                                "params": {"budgetCents": 4_000},
+                            }
+                        ],
+                        "note": "Increase demand",
+                    }
+                )
+            ),
+        )
+        calls: list[list[dict[str, str]]] = []
+
+        def infer(messages: list[dict[str, str]]) -> dict[str, Any]:
+            calls.append(deepcopy(messages))
+            return provider_response(
+                json.dumps(
+                    {
+                        "actions": [
+                            {
+                                "type": "set_marketing",
+                                "params": {"budgetCents": 500},
+                            }
+                        ],
+                        "note": "Corrected recurring-spend assumption",
+                    }
+                )
+            )
+
+        reviewed = DecisionHarness().review(
+            observation(),
+            infer,
+            original_decision=original,
+            verification={
+                "route": "revision_required",
+                "materialStateMisreadProbability": 0.82,
+            },
+            revision_required=True,
+            outcome_feedback={"alerts": ["negative_operating_profit"]},
+        )
+
+        self.assertEqual(calls[0][0]["content"], PLAN_REVIEW_SYSTEM_PROMPT)
+        payload = json.loads(calls[0][1]["content"])
+        request = payload["reviewRequest"]
+        self.assertTrue(request["revisionRequired"])
+        self.assertEqual(request["originalDecision"]["note"], "Increase demand")
+        self.assertEqual(
+            request["deterministicReview"]["validatedActions"],
+            request["originalDecision"]["actions"],
+        )
+        self.assertEqual(
+            request["verification"]["materialStateMisreadProbability"], 0.82
+        )
+        self.assertEqual(payload["outcomeFeedback"]["alerts"], ["negative_operating_profit"])
+        self.assertEqual(reviewed.actions[0]["params"]["budgetCents"], 500)
 
     def test_validity_metrics_are_a_cumulative_funnel(self) -> None:
         cases = [
